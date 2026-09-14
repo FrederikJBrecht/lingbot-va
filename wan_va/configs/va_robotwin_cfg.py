@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
 from .shared_config import va_shared_cfg
@@ -6,7 +8,7 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = os.environ["LINGBOT_CKPT"]
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
