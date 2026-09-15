@@ -36,7 +36,10 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
-
+try:
+    from memfail_probe import cache_probe
+except ImportError:
+    cache_probe = None
 
 class VA_Server:
 
@@ -567,6 +570,9 @@ class VA_Server:
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
+
+        if cache_probe: cache_probe.record(self.transformer, frame_st_id, tag="post_infer")
+
         return actions, latents
 
     def _compute_kv_cache(self, obs):
@@ -602,6 +608,7 @@ class VA_Server:
                              action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+        if cache_probe: cache_probe.record(self.transformer, self.frame_st_id, tag="post_kv")
 
     @torch.no_grad()
     def infer(self, obs):
