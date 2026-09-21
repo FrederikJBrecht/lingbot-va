@@ -446,6 +446,8 @@ class VA_Server:
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
+            # memfail: dump the init observation too — obs_data_{N} (:581) only covers the stream after it
+            save_async(obs['obs'], os.path.join(self.exp_save_root, 'obs_data_init.pt'))
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
