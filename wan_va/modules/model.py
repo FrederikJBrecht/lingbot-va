@@ -34,6 +34,11 @@ except:
     except ImportError:
         flash_attn_func = None
 
+try:  # memfail: read-only attention probe (MEMFAIL_ATTN=1); absent unless scripts/probe is on PYTHONPATH
+    from memfail_probe import attn_probe
+except ImportError:
+    attn_probe = None
+
 __all__ = ['WanTransformer3DModel']
 
 
@@ -454,6 +459,12 @@ class WanAttention(torch.nn.Module):
             valid = mask.nonzero(as_tuple=False).squeeze(-1)
             key = key_pool[:, valid]
             value = value_pool[:, valid]
+
+        if attn_probe is not None and attn_probe.enabled() and kv_cache is not None and slots is not None:
+            # memfail: recompute this attention explicitly for the probe and discard it. The line
+            # below still runs the fused op, so the rollout is unaffected.
+            _c = self.attn_caches[cache_name]
+            attn_probe.record(query, key, value, _c['id'][valid], _c['is_pred'][valid])
 
         hidden_states = self.attn_op(query, key, value)
 

@@ -40,6 +40,10 @@ try:
     from memfail_probe import cache_probe
 except ImportError:
     cache_probe = None
+try:  # memfail: read-only attention probe (MEMFAIL_ATTN=1)
+    from memfail_probe import attn_probe
+except ImportError:
+    attn_probe = None
 
 class VA_Server:
 
@@ -504,6 +508,7 @@ class VA_Server:
                     None,
                     frame_st_id=frame_st_id)
 
+                if attn_probe: attn_probe.set_ctx(self.exp_save_root, frame_st_id, 'video', i, last_step)
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -544,6 +549,7 @@ class VA_Server:
                     None,
                     action_cond,
                     frame_st_id=frame_st_id)
+                if attn_probe: attn_probe.set_ctx(self.exp_save_root, frame_st_id, 'action', i, last_step)
                 action_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['action_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -596,6 +602,7 @@ class VA_Server:
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
 
+        if attn_probe: attn_probe.set_ctx(None, self.frame_st_id, 'kv', -1, False)
         with (
                 torch.no_grad(),
         ):
@@ -611,6 +618,7 @@ class VA_Server:
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
         if cache_probe: cache_probe.record(self.transformer, self.frame_st_id, tag="post_kv")
+        if attn_probe: attn_probe.flush(self.exp_save_root, self.frame_st_id)
 
     @torch.no_grad()
     def infer(self, obs):
