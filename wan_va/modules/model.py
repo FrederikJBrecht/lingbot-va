@@ -38,6 +38,10 @@ try:  # memfail: read-only attention probe (MEMFAIL_ATTN=1); absent unless scrip
     from memfail_probe import attn_probe
 except ImportError:
     attn_probe = None
+try:  # memfail: KV ablation (MEMFAIL_ABLATE=calls). UNLIKE the probe, this CHANGES the rollout.
+    from memfail_probe import kv_ablate
+except ImportError:
+    kv_ablate = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -457,6 +461,10 @@ class WanAttention(torch.nn.Module):
             value_pool = self.attn_caches[cache_name]['v']
             mask = self.attn_caches[cache_name]['mask']
             valid = mask.nonzero(as_tuple=False).squeeze(-1)
+            if kv_ablate is not None and kv_ablate.active():
+                # memfail: hide the configured past calls from THIS pass only. The cache itself is
+                # untouched, so the other stream and every later step still see those keys.
+                valid = kv_ablate.filter_valid(valid, self.attn_caches[cache_name]['id'][valid])
             key = key_pool[:, valid]
             value = value_pool[:, valid]
 

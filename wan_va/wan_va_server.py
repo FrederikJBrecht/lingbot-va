@@ -44,6 +44,10 @@ try:  # memfail: read-only attention probe (MEMFAIL_ATTN=1)
     from memfail_probe import attn_probe
 except ImportError:
     attn_probe = None
+try:  # memfail: KV ablation (MEMFAIL_ABLATE=calls); changes the rollout, off by default
+    from memfail_probe import kv_ablate
+except ImportError:
+    kv_ablate = None
 
 class VA_Server:
 
@@ -442,6 +446,18 @@ class VA_Server:
                 dtype=self.dtype,
             )
 
+        # memfail: optional per-episode seeding (MEMFAIL_SEED). OFF by default, so nothing about
+        # the unseeded evaluation changes. With it set, the diffusion noise is a function of the
+        # episode index alone, which makes ablated and unablated runs directly paired.
+        _mf_seed = os.environ.get("MEMFAIL_SEED")
+        if _mf_seed is not None:
+            self._mf_episode = getattr(self, "_mf_episode", -1) + 1
+            torch.manual_seed(int(_mf_seed) + self._mf_episode)
+            torch.cuda.manual_seed_all(int(_mf_seed) + self._mf_episode)
+            logger.info(f"memfail: seeded episode {self._mf_episode} with {int(_mf_seed) + self._mf_episode}")
+        if kv_ablate and kv_ablate.enabled():   # cumulative, so a flat count means it never fired
+            logger.info(f"memfail ablation: {kv_ablate.summary()}")
+
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
@@ -509,6 +525,7 @@ class VA_Server:
                     frame_st_id=frame_st_id)
 
                 if attn_probe: attn_probe.set_ctx(self.exp_save_root, frame_st_id, 'video', i, last_step)
+                if kv_ablate: kv_ablate.set_stream('video')
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -550,6 +567,7 @@ class VA_Server:
                     action_cond,
                     frame_st_id=frame_st_id)
                 if attn_probe: attn_probe.set_ctx(self.exp_save_root, frame_st_id, 'action', i, last_step)
+                if kv_ablate: kv_ablate.set_stream('action')
                 action_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['action_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -603,6 +621,7 @@ class VA_Server:
                                                 frame_st_id=self.frame_st_id)
 
         if attn_probe: attn_probe.set_ctx(None, self.frame_st_id, 'kv', -1, False)
+        if kv_ablate: kv_ablate.set_stream('kv')   # the real-observation passes are never ablated
         with (
                 torch.no_grad(),
         ):
