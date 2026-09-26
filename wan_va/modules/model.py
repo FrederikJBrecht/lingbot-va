@@ -42,6 +42,10 @@ try:  # memfail: KV ablation (MEMFAIL_ABLATE=calls). UNLIKE the probe, this CHAN
     from memfail_probe import kv_ablate
 except ImportError:
     kv_ablate = None
+try:  # memfail: KV activation patching (MEMFAIL_PATCH); also CHANGES the rollout
+    from memfail_probe import kv_patch
+except ImportError:
+    kv_patch = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -457,6 +461,11 @@ class WanAttention(torch.nn.Module):
                                       key,
                                       value,
                                       is_pred=(update_cache == 1))
+            if kv_patch is not None and kv_patch.enabled() and update_cache == 2:
+                # memfail: real-observation write. Record it, or overwrite it with a donor
+                # episode's. Same call -> same RoPE phase, so no unrotate/re-rotate is needed.
+                _c = self.attn_caches[cache_name]
+                kv_patch.on_write(_c, slots, _c['id'][slots])
             key_pool = self.attn_caches[cache_name]['k']
             value_pool = self.attn_caches[cache_name]['v']
             mask = self.attn_caches[cache_name]['mask']

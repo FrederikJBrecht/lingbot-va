@@ -48,6 +48,10 @@ try:  # memfail: KV ablation (MEMFAIL_ABLATE=calls); changes the rollout, off by
     from memfail_probe import kv_ablate
 except ImportError:
     kv_ablate = None
+try:  # memfail: KV activation patching (MEMFAIL_PATCH); changes the rollout, off by default
+    from memfail_probe import kv_patch
+except ImportError:
+    kv_patch = None
 
 class VA_Server:
 
@@ -449,14 +453,17 @@ class VA_Server:
         # memfail: optional per-episode seeding (MEMFAIL_SEED). OFF by default, so nothing about
         # the unseeded evaluation changes. With it set, the diffusion noise is a function of the
         # episode index alone, which makes ablated and unablated runs directly paired.
+        self._mf_episode = getattr(self, "_mf_episode", -1) + 1   # counts resets, seeded or not
         _mf_seed = os.environ.get("MEMFAIL_SEED")
         if _mf_seed is not None:
-            self._mf_episode = getattr(self, "_mf_episode", -1) + 1
             torch.manual_seed(int(_mf_seed) + self._mf_episode)
             torch.cuda.manual_seed_all(int(_mf_seed) + self._mf_episode)
             logger.info(f"memfail: seeded episode {self._mf_episode} with {int(_mf_seed) + self._mf_episode}")
         if kv_ablate and kv_ablate.enabled():   # cumulative, so a flat count means it never fired
             logger.info(f"memfail ablation: {kv_ablate.summary()}")
+        if kv_patch and kv_patch.enabled():
+            kv_patch.start_episode(self._mf_episode)
+            logger.info(f"memfail patch: {kv_patch.summary()}")
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
@@ -625,11 +632,13 @@ class VA_Server:
         with (
                 torch.no_grad(),
         ):
+            if kv_patch: kv_patch.new_pass()
             self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                              update_cache=2,
                              cache_name=self.cache_name,
                              action_mode=False)
 
+            if kv_patch: kv_patch.new_pass()
             self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
                              update_cache=2,
                              cache_name=self.cache_name,
@@ -638,6 +647,7 @@ class VA_Server:
         self.frame_st_id += latent_model_input.shape[2]
         if cache_probe: cache_probe.record(self.transformer, self.frame_st_id, tag="post_kv")
         if attn_probe: attn_probe.flush(self.exp_save_root, self.frame_st_id)
+        if kv_patch: kv_patch.flush_episode()
 
     @torch.no_grad()
     def infer(self, obs):
