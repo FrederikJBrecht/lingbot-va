@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import math
+import os
 from copy import deepcopy
 
 import torch
@@ -50,9 +51,38 @@ except ImportError:
 __all__ = ['WanTransformer3DModel']
 
 
-def custom_sdpa(q, k, v):
+# memfail: attention-sink arms on the FIRST video chunk (decisions.md 2026-10-03). Two independent
+# knobs, both OFF when unset, so an unset environment reproduces upstream bit-for-bit.
+#   MEMFAIL_SINK=video     block-0 VIDEO keys (frame_ids == 0) are exempt from block_window_mask, so a
+#                          late query can always reach the first chunk during TRAINING (arm B). This is a
+#                          no-op at inference: custom_sdpa applies no window mask and the 72-slot FIFO
+#                          cache is itself the window.
+#   MEMFAIL_SINK_BIAS=b    additive PRE-SOFTMAX logit bias b on those same keys, train AND infer (arm A).
+#                          b is on the ln scale: those keys' softmax weight is scaled by e^b.
+# "block 0" is frame_ids == 0, i.e. the VIDEO keys of the first chunk only; the interleaved action keys
+# of that chunk are frame_ids == 1 (:131) and are deliberately not touched. At training that block spans
+# chunk_size (1-4) latent frames; at inference cache id 0 is exactly 2 (init latent + the encoder's
+# one-frame first chunk), so the two are equal only at the chunk_size == 2 draw.
+_SINK = os.environ.get("MEMFAIL_SINK", "")
+_SINK_BIAS = float(os.environ.get("MEMFAIL_SINK_BIAS", "0") or 0)
+
+
+def _sink_score_mod(frame_ids):
+    """memfail: flex score_mod adding _SINK_BIAS to block-0 video keys; None when the arm is off."""
+    if not _SINK_BIAS:
+        return None
+    bias = torch.where(frame_ids == 0, float(_SINK_BIAS), 0.0).to(torch.float32)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[kv_idx]
+
+    return score_mod
+
+
+def custom_sdpa(q, k, v, attn_bias=None):
+    # memfail: attn_bias is an ADDITIVE float mask (arm A), broadcast over queries. None => upstream call.
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                         v.transpose(1, 2))
+                                         v.transpose(1, 2), attn_mask=attn_bias)
     return out.transpose(1, 2)
 
 class FlexAttnFunc(nn.Module):
@@ -62,6 +92,7 @@ class FlexAttnFunc(nn.Module):
     compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
+    score_mod: ClassVar[Callable] = None   # memfail: set by init_mask, self-attention only
 
     def __init__(
         self, 
@@ -94,7 +125,8 @@ class FlexAttnFunc(nn.Module):
 
         block_mask = FlexAttnFunc.cross_attention_mask if self.is_cross else FlexAttnFunc.attention_mask
 
-        x_out = FlexAttnFunc.flex_attn(q_varlen, k_varlen, v_varlen, block_mask=block_mask, kernel_options = {
+        score_mod = None if self.is_cross else FlexAttnFunc.score_mod
+        x_out = FlexAttnFunc.flex_attn(q_varlen, k_varlen, v_varlen, score_mod=score_mod, block_mask=block_mask, kernel_options = {
                                                     "BLOCK_M": 64,
                                                     "BLOCK_N": 64,
                                                     "BLOCK_M1": 32,
@@ -143,11 +175,14 @@ class FlexAttnFunc(nn.Module):
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
+        frame_ids_dev = frame_ids.long().to(device)
+        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids_dev, noise_ids.long().to(device), window_size)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
             )
         FlexAttnFunc.attention_mask = block_mask
+        # memfail (arm A): closes over one device tensor, rebuilt with the block mask each step.
+        FlexAttnFunc.score_mod = _sink_score_mod(frame_ids_dev)
 
         text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
@@ -213,7 +248,14 @@ class FlexAttnFunc(nn.Module):
         mask_list.append(and_masks(noise2noise_mask, block_self_mask))
         mask = or_masks(*mask_list)
         mask = and_masks(mask, seq_mask)
-        mask = and_masks(mask, partial(block_window_mask, window_size=window_size))
+        window = partial(block_window_mask, window_size=window_size)
+        if _SINK == "video":
+            # memfail (arm B): block-0 video keys escape the WINDOW only. Causality and the noise-regime
+            # rules are ANDed in above, so the exemption cannot admit an acausal or wrong-regime key.
+            def sink_mask(b, h, q_idx, kv_idx):
+                return frame_ids[kv_idx] == 0
+            window = or_masks(window, sink_mask)
+        mask = and_masks(mask, window)
         return mask
        
 class WanTimeTextImageEmbedding(nn.Module):
@@ -456,6 +498,7 @@ class WanAttention(torch.nn.Module):
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
         slots = None
+        attn_bias = None
         if kv_cache is not None and kv_cache['k'] is not None:
             slots = self.update_cache(cache_name,
                                       key,
@@ -476,6 +519,12 @@ class WanAttention(torch.nn.Module):
                 valid = kv_ablate.filter_valid(valid, self.attn_caches[cache_name]['id'][valid])
             key = key_pool[:, valid]
             value = value_pool[:, valid]
+            if _SINK_BIAS:
+                # memfail (arm A): +_SINK_BIAS on cache id 0 = the first VIDEO write (even ids are video;
+                # id 0 holds the init latent + the encoder's one-frame first chunk = latent frames 0-1).
+                # Shape [1,1,1,Lk] broadcasts over the [B, heads, Lq, Lk] scores inside custom_sdpa.
+                _sink_ids = self.attn_caches[cache_name]['id'][valid]
+                attn_bias = torch.where(_sink_ids == 0, float(_SINK_BIAS), 0.0).to(query.dtype)[None, None, None, :]
 
         if attn_probe is not None and attn_probe.enabled() and kv_cache is not None and slots is not None:
             # memfail: recompute this attention explicitly for the probe and discard it. The line
@@ -483,7 +532,10 @@ class WanAttention(torch.nn.Module):
             _c = self.attn_caches[cache_name]
             attn_probe.record(query, key, value, _c['id'][valid], _c['is_pred'][valid])
 
-        hidden_states = self.attn_op(query, key, value)
+        if attn_bias is None:
+            hidden_states = self.attn_op(query, key, value)
+        else:
+            hidden_states = self.attn_op(query, key, value, attn_bias)   # memfail: torch mode only
 
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
